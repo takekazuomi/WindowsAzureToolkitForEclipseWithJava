@@ -37,9 +37,11 @@ namespace MicrosoftOpenTechnologies.Tools.SessionAffinityAgent
         /// Starts the ArrWorker agent.
         /// This method returns as soon as IIS is configured to forward http traffic to ARR farm.
         /// </summary>
-        internal static void Start(string arrEndpointName, string serverEndPointName)
+        internal static void Start(string arrEndpointName, string serverEndPointName, byte[] certHash, string certStoreName, string serverRedirectEndpointName)
         {
             RoleInstanceEndpoint arrEndpoint;
+            RoleInstanceEndpoint serverRedirectEndpoint=null;
+
 
             // Get the arr endpoint on which we expect to see http traffic.
             if (!RoleEnvironment.CurrentRoleInstance.InstanceEndpoints.TryGetValue(arrEndpointName, out arrEndpoint))
@@ -47,8 +49,17 @@ namespace MicrosoftOpenTechnologies.Tools.SessionAffinityAgent
                 throw new InvalidOperationException("Invalid ARR endpoint name");
             }
 
+            if (serverRedirectEndpointName != null)
+            {
+                // Get the arr endpoint on which we expect to see http traffic.
+                if (!RoleEnvironment.CurrentRoleInstance.InstanceEndpoints.TryGetValue(serverRedirectEndpointName, out serverRedirectEndpoint))
+                {
+                    throw new InvalidOperationException("Invalid Redirect endpoint name");
+                }
+            }
+
             // Do one-time IIS/ARR setup.
-            ConfigureOnce(serverEndPointName, arrEndpoint.IPEndpoint);
+            ConfigureOnce(serverEndPointName, arrEndpoint.IPEndpoint, certHash, certStoreName, serverRedirectEndpointName, serverRedirectEndpoint != null ? serverRedirectEndpoint.IPEndpoint : null);
 
             // Update the server farm based on the discovered server endpoint instances.
             UpdateFarm(serverEndPointName);
@@ -67,7 +78,7 @@ namespace MicrosoftOpenTechnologies.Tools.SessionAffinityAgent
         /// <summary>
         /// Performs one-time configuration of IIS/ARR.
         /// </summary>
-        private static void ConfigureOnce(string serverEndpointName, IPEndPoint bindInfo)
+        private static void ConfigureOnce(string serverEndpointName, IPEndPoint bindInfo, byte[] certHash, string certStoreName, string serverRedirectEndpointName, IPEndPoint serverRedirectBindInfo)
         {
             using (ServerManager sm = new ServerManager())
             {
@@ -85,21 +96,44 @@ namespace MicrosoftOpenTechnologies.Tools.SessionAffinityAgent
 
                 if (!ruleFound)
                 {
-                    ConfigurationElement rule = rules.GetCollection().CreateElement("rule");
-                    rule.SetAttributeValue("name", serverEndpointName);
-                    rule.SetAttributeValue("stopProcessing", true);
-                    rule.GetChildElement("match").SetAttributeValue("url", ".*");
-                    rule.GetChildElement("action").SetAttributeValue("type", "Rewrite");
-                    rule.GetChildElement("action").SetAttributeValue(
-                        "url",
-                        string.Format(CultureInfo.InvariantCulture, @"http://{0}/{{R:0}}", serverEndpointName));
+                    if (serverRedirectEndpointName != null)
+                    {
+                        ConfigurationElement rule = rules.GetCollection().CreateElement("rule");
+                        rule.SetAttributeValue("name", serverRedirectEndpointName);
+                        rule.SetAttributeValue("stopProcessing", true);
 
-                    rules.GetCollection().Add(rule);
+                        rule.GetChildElement("match").SetAttributeValue("url", ".*");
 
+                        ConfigurationElement conditions = rule.GetChildElement("conditions");
+
+                        ConfigurationElement addElement = conditions.GetCollection().CreateElement("add");
+                        addElement["input"] = @"{HTTPS}";
+                        addElement["pattern"] = @"^OFF$";
+                        conditions.GetCollection().Add(addElement);
+
+                        rule.GetChildElement("action").SetAttributeValue("type", "Redirect");
+                        rule.GetChildElement("action").SetAttributeValue("redirectType", "Found");
+                        rule.GetChildElement("action").SetAttributeValue("url", @"https://{HTTP_HOST}/{R:0}");
+
+                        rules.GetCollection().Add(rule);
+                    }
+
+                    {
+                        ConfigurationElement rule = rules.GetCollection().CreateElement("rule");
+                        rule.SetAttributeValue("name", serverEndpointName);
+                        rule.SetAttributeValue("stopProcessing", true);
+                        rule.GetChildElement("match").SetAttributeValue("url", ".*");
+                        rule.GetChildElement("action").SetAttributeValue("type", "Rewrite");
+                        rule.GetChildElement("action").SetAttributeValue(
+                            "url",
+                            string.Format(CultureInfo.InvariantCulture, @"http://{0}/{{R:0}}", serverEndpointName));
+
+                        rules.GetCollection().Add(rule);
+                    }
                     // Ensure that the default app pool is set to classic mode.
                     Debug.Assert(sm.ApplicationPools["DefaultAppPool"] != null, "DefaultAppPool is not present");
                     sm.ApplicationPools["DefaultAppPool"].ManagedPipelineMode =
-                        ManagedPipelineMode.Classic;                    
+                        ManagedPipelineMode.Classic;
 
                     // Make sure that we have a binging in the default web site, which listens on ARR port.
                     Debug.Assert(sm.Sites["Default Web Site"] != null, "Default Web Site is not present");
@@ -107,11 +141,34 @@ namespace MicrosoftOpenTechnologies.Tools.SessionAffinityAgent
                     {
                         if (binding.Protocol.Equals("http", StringComparison.OrdinalIgnoreCase))
                         {
-                            binding["bindingInformation"] = string.Format(
+                            var bindingInformation = string.Format(
                                 CultureInfo.InvariantCulture,
                                 "{0}:{1}:",
                                 bindInfo.Address.ToString(),
                                 bindInfo.Port);
+
+                            if (certHash != null)
+                            {
+                                var httpsBinding = sm.Sites["Default Web Site"].Bindings.Add(bindingInformation, certHash, certStoreName);
+                                httpsBinding.Protocol = "https";
+
+                                if (serverRedirectEndpointName != null)
+                                {
+                                    binding["bindingInformation"] = string.Format(
+                                        CultureInfo.InvariantCulture,
+                                        "{0}:{1}:",
+                                        serverRedirectBindInfo.Address.ToString(),
+                                        serverRedirectBindInfo.Port);
+                                }
+                                else
+                                {
+                                    sm.Sites["Default Web Site"].Bindings.Remove(binding);
+                                }
+                            }
+                            else
+                            {
+                                binding["bindingInformation"] = bindingInformation;
+                            }
                             break;
                         }
                     }
